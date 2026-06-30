@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::*;
 
@@ -79,6 +79,42 @@ impl JsSolverConfig {
     pub fn set_max_iter(&mut self, val: Option<i32>) { self.max_iter = val; }
 }
 
+#[derive(Default, Deserialize)]
+struct JsConfigInput {
+    #[serde(default)]
+    strategy: Option<String>,
+    #[serde(default)]
+    default_domain_lo: Option<f64>,
+    #[serde(default)]
+    default_domain_hi: Option<f64>,
+    #[serde(default)]
+    penalty_weight: Option<f64>,
+    #[serde(default)]
+    montecarlo_n: Option<i32>,
+    #[serde(default)]
+    feasibility_tol: Option<f64>,
+    #[serde(default)]
+    popsize: Option<i32>,
+    #[serde(default)]
+    max_iter: Option<i32>,
+}
+
+fn config_from_jsvalue(cfg: JsValue) -> SolverConfig {
+    let input: JsConfigInput = serde_wasm_bindgen::from_value(cfg).unwrap_or_default();
+    SolverConfig {
+        strategy: Strategy::from_str(&input.strategy.unwrap_or_else(|| "punto_medio".into())),
+        default_domain: (
+            input.default_domain_lo.unwrap_or(0.0),
+            input.default_domain_hi.unwrap_or(100.0),
+        ),
+        penalty_weight: input.penalty_weight.unwrap_or(1e6),
+        montecarlo_n: input.montecarlo_n.unwrap_or(2000) as usize,
+        feasibility_tol: input.feasibility_tol.unwrap_or(1e-4),
+        popsize: input.popsize.unwrap_or(10) as usize,
+        max_iter: input.max_iter.unwrap_or(1000) as usize,
+    }
+}
+
 #[wasm_bindgen]
 pub struct JsSolverResult {
     feasible: bool,
@@ -141,21 +177,6 @@ impl JsValidationResult {
     pub fn errors(&self) -> Vec<String> { self.errors.clone() }
 }
 
-fn to_solver_config(cfg: &JsSolverConfig) -> SolverConfig {
-    SolverConfig {
-        strategy: Strategy::from_str(&cfg.strategy),
-        default_domain: (
-            cfg.default_domain_lo.unwrap_or(0.0),
-            cfg.default_domain_hi.unwrap_or(100.0),
-        ),
-        penalty_weight: cfg.penalty_weight.unwrap_or(1e6),
-        montecarlo_n: cfg.montecarlo_n.unwrap_or(2000) as usize,
-        feasibility_tol: cfg.feasibility_tol.unwrap_or(1e-4),
-        popsize: cfg.popsize.unwrap_or(10) as usize,
-        max_iter: cfg.max_iter.unwrap_or(1000) as usize,
-    }
-}
-
 fn hashmap_to_obj(map: &HashMap<String, f64>) -> JsValue {
     let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
     map.serialize(&serializer).unwrap_or(JsValue::NULL)
@@ -171,8 +192,8 @@ fn libertad_to_jsvec(entries: Vec<LibertadEntry>) -> Vec<JsValue> {
 }
 
 #[wasm_bindgen]
-pub fn validate(script: String, cfg: &JsSolverConfig) -> JsValidationResult {
-    let config = to_solver_config(cfg);
+pub fn validate(script: String, cfg: JsValue) -> JsValidationResult {
+    let config = config_from_jsvalue(cfg);
     match crate::validate_dsl(&script, &config) {
         Ok(()) => JsValidationResult {
             valid: true,
@@ -186,8 +207,8 @@ pub fn validate(script: String, cfg: &JsSolverConfig) -> JsValidationResult {
 }
 
 #[wasm_bindgen]
-pub fn solve(script: String, cfg: &JsSolverConfig) -> JsSolverResult {
-    let config = to_solver_config(cfg);
+pub fn solve(script: String, cfg: JsValue) -> JsSolverResult {
+    let config = config_from_jsvalue(cfg);
     let result = crate::solve(&script, &config);
 
     JsSolverResult {
