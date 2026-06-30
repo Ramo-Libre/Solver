@@ -436,24 +436,6 @@ pub fn validate_dsl(script: &str, config: &SolverConfig) -> Result<(), Vec<Strin
         }
     }
 
-    // Detectar constraints sin variables (ej: "1 > 0")
-    let has_constraints_with_vars = stmts.iter().any(|s| {
-        if let Statement::Constraint { left, right, .. } = s {
-            let mut vars = std::collections::HashSet::new();
-            collect_vars_from_ast(left, &mut vars);
-            collect_vars_from_ast(right, &mut vars);
-            !vars.is_empty()
-        } else {
-            false
-        }
-    });
-
-    if free_vars.is_empty() && has_constraints_with_vars {
-        errors.push(
-            "Hay restricciones con variables pero ninguna variable libre fue declarada. Usá 'dominio' o 'in' para declararlas.".into()
-        );
-    }
-
     if stmts.iter().all(|s| !matches!(s, Statement::Constraint { .. })) {
         errors.push(
             "El script debe tener al menos una restricción (>=, <=, >, <, ==)".into()
@@ -836,6 +818,9 @@ fn differential_evolution(
     seed: u64,
 ) -> Vec<f64> {
     let n = bounds.len();
+    if n == 0 {
+        return Vec::new();
+    }
     let pop_size = popsize * n;
     let mut rng = SmallRng::seed_from_u64(seed);
 
