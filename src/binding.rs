@@ -48,8 +48,8 @@ fn to_solver_config(cfg: JsSolverConfig) -> SolverConfig {
     SolverConfig {
         strategy: Strategy::from_str(&cfg.strategy),
         default_domain: (
-            cfg.default_domain_lo.unwrap_or(1.0),
-            cfg.default_domain_hi.unwrap_or(7.0),
+            cfg.default_domain_lo.unwrap_or(0.0),
+            cfg.default_domain_hi.unwrap_or(100.0),
         ),
         penalty_weight: cfg.penalty_weight.unwrap_or(1e6),
         montecarlo_n: cfg.montecarlo_n.unwrap_or(2000) as usize,

@@ -51,8 +51,8 @@ fn to_solver_config(cfg: JsSolverConfig) -> SolverConfig {
     SolverConfig {
         strategy: Strategy::from_str(&cfg.strategy),
         default_domain: (
-            cfg.default_domain_lo.unwrap_or(1.0),
-            cfg.default_domain_hi.unwrap_or(7.0),
+            cfg.default_domain_lo.unwrap_or(0.0),
+            cfg.default_domain_hi.unwrap_or(100.0),
         ),
         penalty_weight: cfg.penalty_weight.unwrap_or(1e6),
         montecarlo_n: cfg.montecarlo_n.unwrap_or(2000) as usize,
@@ -60,6 +60,34 @@ fn to_solver_config(cfg: JsSolverConfig) -> SolverConfig {
         popsize: cfg.popsize.unwrap_or(10) as usize,
         max_iter: cfg.max_iter.unwrap_or(1000) as usize,
     }
+}
+
+/// Resultado de validación expuesto a JS
+#[derive(Serialize)]
+pub struct JsValidationResult {
+    pub valid: bool,
+    pub errors: Vec<String>,
+}
+
+/// Valida un script DSL sin ejecutar el solver.
+/// Útil para feedback en tiempo real desde el frontend.
+#[wasm_bindgen]
+pub fn validate(script: String, cfg_val: JsValue) -> Result<JsValue, JsValue> {
+    let cfg: JsSolverConfig = serde_wasm_bindgen::from_value(cfg_val)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let config = to_solver_config(cfg);
+
+    match crate::validate_dsl(&script, &config) {
+        Ok(()) => serde_wasm_bindgen::to_value(&JsValidationResult {
+            valid: true,
+            errors: Vec::new(),
+        }),
+        Err(errors) => serde_wasm_bindgen::to_value(&JsValidationResult {
+            valid: false,
+            errors,
+        }),
+    }
+    .map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
 /// Resuelve un script DSL y retorna el resultado para la Web.

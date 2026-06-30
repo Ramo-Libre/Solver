@@ -54,7 +54,7 @@ fn main() {
     let mut montecarlo_n: usize = 2000;
     let mut popsize: usize = 10;
     let mut penalty_weight: f64 = 1e6;
-    let mut default_domain: (f64, f64) = (1.0, 7.0);
+    let mut default_domain: (f64, f64) = (0.0, 100.0);
     let mut feasibility_tol: f64 = 1e-4;
     let mut pretty = false;
 

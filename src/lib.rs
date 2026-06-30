@@ -391,8 +391,91 @@ pub fn parse_script(script: &str) -> Vec<Statement> {
     stmts
 }
 
+/// Valida que el script cumpla con reglas básicas del DSL.
+/// Retorna Ok(()) o Err con una lista de errores descriptivos.
+pub fn validate_dsl(script: &str, config: &SolverConfig) -> Result<(), Vec<String>> {
+    let mut errors: Vec<String> = Vec::new();
+    let mut stmts = Vec::new();
+    let mut ignored_lines: Vec<(usize, String)> = Vec::new();
+
+    for (i, raw_line) in script.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with("//") {
+            continue;
+        }
+        if let Some(stmt) = parse_line(line) {
+            stmts.push(stmt);
+        } else {
+            ignored_lines.push((i + 1, line.to_string()));
+        }
+    }
+
+    // Líneas ignoradas → siempre error (no hay keywords especiales en el DSL)
+    for (lineno, text) in &ignored_lines {
+        errors.push(format!(
+            "Línea {}: no se pudo interpretar — '{}'",
+            lineno, text
+        ));
+    }
+
+    // Si no hay statements, no hay nada que validar (script vacío o solo keywords)
+    if stmts.is_empty() && errors.is_empty() {
+        return Ok(());
+    }
+
+    let free_vars = extract_free_variables(&stmts);
+    let domains = extract_domains(&stmts);
+
+    // Verificar que toda variable libre tenga dominio
+    for v in &free_vars {
+        if !domains.contains_key(v) && !config.default_domain_enabled() {
+            errors.push(format!(
+                "Variable '{}' no tiene dominio definido y no hay default_domain configurado",
+                v
+            ));
+        }
+    }
+
+    // Detectar constraints sin variables (ej: "1 > 0")
+    let has_constraints_with_vars = stmts.iter().any(|s| {
+        if let Statement::Constraint { left, right, .. } = s {
+            let mut vars = std::collections::HashSet::new();
+            collect_vars_from_ast(left, &mut vars);
+            collect_vars_from_ast(right, &mut vars);
+            !vars.is_empty()
+        } else {
+            false
+        }
+    });
+
+    if free_vars.is_empty() && has_constraints_with_vars {
+        errors.push(
+            "Hay restricciones con variables pero ninguna variable libre fue declarada. Usá 'dominio' o 'in' para declararlas.".into()
+        );
+    }
+
+    if stmts.iter().all(|s| !matches!(s, Statement::Constraint { .. })) {
+        errors.push(
+            "El script debe tener al menos una restricción (>=, <=, >, <, ==)".into()
+        );
+    }
+
+    if errors.is_empty() { Ok(()) } else { Err(errors) }
+}
+
+/// Retorna true si el solver tiene un default_domain configurable (distinto de (0,0))
+impl SolverConfig {
+    fn default_domain_enabled(&self) -> bool {
+        self.default_domain.0 != 0.0 || self.default_domain.1 != 0.0
+    }
+}
+
 fn parse_line(line: &str) -> Option<Statement> {
     let (label, rest) = extract_label(line);
+
+    if rest.contains(';') {
+        return None;
+    }
 
     // Dominio con keyword "dominio"
     if rest.to_lowercase().starts_with("dominio") {
@@ -641,7 +724,7 @@ impl Default for SolverConfig {
     fn default() -> Self {
         Self {
             strategy: Strategy::PuntoMedio,
-            default_domain: (1.0, 7.0),
+            default_domain: (0.0, 100.0),
             penalty_weight: 1e6,
             montecarlo_n: 2000,
             feasibility_tol: 1e-4,
@@ -878,6 +961,22 @@ fn slsqp_polish(
 // ── Entrada pública del solver ────────────────────────────────────────────────
 
 pub fn solve(script: &str, config: &SolverConfig) -> SolverResult {
+    // Validar antes de ejecutar
+    if let Err(errors) = validate_dsl(script, config) {
+        return SolverResult {
+            feasible: false,
+            plan: HashMap::new(),
+            penalty: f64::INFINITY,
+            strategy: config.strategy.name().to_string(),
+            probability: 0.0,
+            effectiveness: 0.0,
+            montecarlo_samples: 0,
+            constraint_violations: errors,
+            libertad: Vec::new(),
+            elapsed_ms: 0,
+        };
+    }
+
     let start = Instant::now();
 
     let stmts = parse_script(script);
@@ -890,32 +989,36 @@ pub fn solve(script: &str, config: &SolverConfig) -> SolverResult {
 
     let mids: Vec<f64> = bounds.iter().map(|(lo, hi)| (lo + hi) / 2.0).collect();
 
-    // ── Paso 1: Differential Evolution (búsqueda global) ─────────────────────
-    let x_de = differential_evolution(
-        &stmts, &free_vars, &bounds, &mids,
-        &config.strategy, config.penalty_weight,
-        config.popsize, config.max_iter, 42,
-    );
+    // ── Optimizar variables libres (si hay) ────────────────────────────────────
+    let (x_best, _pen) = if free_vars.is_empty() {
+        // Sin variables libres: evaluar constraints directamente como booleanos
+        // (la penalización por gradiente no funciona con solo literales)
+        (Vec::new(), 0.0)
+    } else {
+        let x_de = differential_evolution(
+            &stmts, &free_vars, &bounds, &mids,
+            &config.strategy, config.penalty_weight,
+            config.popsize, config.max_iter, 42,
+        );
 
-    // ── Paso 2: Polish con descenso de gradiente proyectado ───────────────────
-    let x_polished = slsqp_polish(
-        x_de.clone(), &free_vars, &stmts, &bounds, &mids,
-        &config.strategy, config.penalty_weight, 5000,
-    );
+        let x_polished = slsqp_polish(
+            x_de.clone(), &free_vars, &stmts, &bounds, &mids,
+            &config.strategy, config.penalty_weight, 5000,
+        );
 
-    // Elegir el mejor según penalización real
-    let pen_de = {
-        let free: HashMap<_, _> = free_vars.iter().zip(x_de.iter()).map(|(k,v)|(k.clone(),*v)).collect();
-        let ctx = build_context(&stmts, &free);
-        total_penalty(&stmts, &ctx)
+        let pen_de = {
+            let free: HashMap<_, _> = free_vars.iter().zip(x_de.iter()).map(|(k,v)|(k.clone(),*v)).collect();
+            let ctx = build_context(&stmts, &free);
+            total_penalty(&stmts, &ctx)
+        };
+        let pen_pol = {
+            let free: HashMap<_, _> = free_vars.iter().zip(x_polished.iter()).map(|(k,v)|(k.clone(),*v)).collect();
+            let ctx = build_context(&stmts, &free);
+            total_penalty(&stmts, &ctx)
+        };
+
+        if pen_pol <= pen_de { (x_polished, pen_pol) } else { (x_de, pen_de) }
     };
-    let pen_pol = {
-        let free: HashMap<_, _> = free_vars.iter().zip(x_polished.iter()).map(|(k,v)|(k.clone(),*v)).collect();
-        let ctx = build_context(&stmts, &free);
-        total_penalty(&stmts, &ctx)
-    };
-
-    let x_best = if pen_pol <= pen_de { x_polished } else { x_de };
 
     // ── Evaluar resultado ─────────────────────────────────────────────────────
     let free_dict: HashMap<String, f64> = free_vars.iter()
@@ -924,11 +1027,49 @@ pub fn solve(script: &str, config: &SolverConfig) -> SolverResult {
         .collect();
     let ctx_best = build_context(&stmts, &free_dict);
     let final_pen = total_penalty(&stmts, &ctx_best);
-    let feasible = final_pen < config.feasibility_tol;
+    let feasible = if free_vars.is_empty() {
+        // Sin variables libres: cada constraint se evalúa como booleano
+        stmts.iter().all(|s| {
+            if let Statement::Constraint { left, op, right, .. } = s {
+                let l = eval_ast(left, &ctx_best).unwrap_or(f64::NAN);
+                let r = eval_ast(right, &ctx_best).unwrap_or(f64::NAN);
+                if l.is_nan() || r.is_nan() { return false; }
+                match op {
+                    RelOp::Gte => l >= r - 1e-12,
+                    RelOp::Lte => l <= r + 1e-12,
+                    RelOp::Gt  => l > r,
+                    RelOp::Lt  => l < r,
+                    RelOp::Eq  => (l - r).abs() < 1e-9,
+                }
+            } else {
+                true
+            }
+        })
+    } else {
+        final_pen < config.feasibility_tol
+    };
 
     let violations: Vec<String> = stmts.iter()
         .filter(|s| matches!(s, Statement::Constraint { .. }))
-        .filter(|s| constraint_penalty(s, &ctx_best) > config.feasibility_tol)
+        .filter(|s| {
+            if free_vars.is_empty() {
+                // Boolean check: violado si la constraint es falsa
+                if let Statement::Constraint { left, op, right, .. } = s {
+                    let l = eval_ast(left, &ctx_best).unwrap_or(f64::NAN);
+                    let r = eval_ast(right, &ctx_best).unwrap_or(f64::NAN);
+                    if l.is_nan() || r.is_nan() { return true; }
+                    !match op {
+                        RelOp::Gte => l >= r - 1e-12,
+                        RelOp::Lte => l <= r + 1e-12,
+                        RelOp::Gt  => l > r,
+                        RelOp::Lt  => l < r,
+                        RelOp::Eq  => (l - r).abs() < 1e-9,
+                    }
+                } else { false }
+            } else {
+                constraint_penalty(s, &ctx_best) > config.feasibility_tol
+            }
+        })
         .filter_map(|s| match s {
             Statement::Constraint { raw, .. } => Some(raw.clone()),
             _ => None,
